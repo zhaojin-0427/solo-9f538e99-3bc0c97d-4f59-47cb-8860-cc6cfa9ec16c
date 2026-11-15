@@ -58,6 +58,20 @@ CREATE TABLE IF NOT EXISTS budget_state (
     CHECK (spent <= total_budget)
 );
 
+-- Daily outpatient totals registered against an imported version for the
+-- weekly reconciliation.  One row per (version, ISO weekday); a same-day
+-- correction overwrites the previous total via UPSERT, so UPDATE is allowed
+-- here (unlike the append-only import/publication tables), but rows can never
+-- be deleted.  Once the version has been published the application rejects
+-- further corrections.
+CREATE TABLE IF NOT EXISTS daily_totals (
+    import_version INTEGER NOT NULL REFERENCES imports(version),
+    day            TEXT    NOT NULL,
+    total          INTEGER NOT NULL CHECK (total >= 0),
+    updated_at     TEXT    NOT NULL,
+    PRIMARY KEY (import_version, day)
+);
+
 -- Imported weeks, their aggregate cells and every published release are
 -- append-only.  Even a bug in the application layer (or a manual SQL client)
 -- cannot rewrite them.
@@ -107,6 +121,14 @@ CREATE TRIGGER IF NOT EXISTS publication_cells_no_delete
 BEFORE DELETE ON publication_cells
 BEGIN
     SELECT RAISE(ABORT, 'publications are immutable');
+END;
+
+-- Reconciliation rows may be overwritten (same-day corrections) but never
+-- removed, so the audit trail of registered daily totals survives.
+CREATE TRIGGER IF NOT EXISTS daily_totals_no_delete
+BEFORE DELETE ON daily_totals
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation daily totals cannot be deleted');
 END;
 """
 

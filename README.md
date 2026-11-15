@@ -26,6 +26,8 @@ DATABASE_PATH=./data/fevers.db uvicorn app.entrypoint:app --port 8000
 | `GET` | `/v1/groups` | 固定公开分组、ε、敏感度、每次发布消耗 |
 | `POST` | `/v1/imports` | 导入一周记录，返回不可改写版本号 |
 | `GET` | `/v1/imports/{version}` | 查询导入元数据 |
+| `PUT` | `/v1/imports/{version}/reconciliation/days/{day}` | 登记/更正某日门诊就诊总数 |
+| `GET` | `/v1/imports/{version}/reconciliation` | 对账状态：缺报日期、七日合计与可否发布 |
 | `POST` | `/v1/publications` | 为某导入版本发布（或重放）加噪计数 |
 | `GET` | `/v1/publications/{version}` | 查询已发布结果 |
 | `GET` | `/v1/publications` | 列出全部已发布结果 |
@@ -50,6 +52,47 @@ curl -s -X POST localhost:8000/v1/imports -H 'Content-Type: application/json' -d
 - `street`、`age_band` 只接受固定公开分组，未知值返回 422。
 - 导入成功即形成不可改写版本：SQLite 触发器和应用逻辑都禁止更新/删除。
 
+### 每日对账（发布前置条件）
+
+疾控汇总员在周报发布前，按导入版本逐日登记门诊就诊总数，核对七天数据是否收齐。
+
+```bash
+# 登记（或更正）某一天的就诊总数，day 为 ISO 周内的 YYYY-MM-DD
+curl -s -X PUT localhost:8000/v1/imports/1/reconciliation/days/2026-05-11 \
+  -H 'Content-Type: application/json' -d '{"total": 12}'
+
+# 查询对账状态
+curl -s localhost:8000/v1/imports/1/reconciliation
+```
+
+```jsonc
+{
+  "import_version": 1,
+  "week": "2026-W20",
+  "days": [                       // 该 ISO 周七天（周一至周日），未报日期 total 为 null
+    {"day": "2026-05-11", "total": 12}
+  ],
+  "missing_days": ["2026-05-12", "..."],   // 尚未登记的日期
+  "reported_total": 12,                     // 已登记七日总数
+  "import_record_count": 20,                // 该版本导入人数
+  "total_matches_import": false,            // 七日齐全且合计等于导入人数才为 true
+  "ready_to_publish": false,
+  "published": false
+}
+```
+
+- `day` 必须属于该导入版本对应的 ISO 周（周一至周日），否则 422
+  `reconciliation_day_outside_week`；`total` 为非负整数。
+- 同一天重复提交即**更正**，新值覆盖旧值（UPSERT）；对账行只能覆盖、不能删除，
+  SQLite 触发器禁止 `DELETE`。
+- 只有**七日全部登记且七日合计等于该版本导入人数**（`ready_to_publish=true`），
+  才允许首次发布；否则发布返回 409 `reconciliation_incomplete`（尚有缺报）或
+  409 `reconciliation_total_mismatch`（合计不符），且不消耗隐私预算。
+- 更正与发布并发时，两者都在 `BEGIN IMMEDIATE` 写事务内执行，按**提交顺序**决定结果：
+  - 更正先提交：发布按更正后的新数核对，不符即拒绝；
+  - 发布先提交：版本关闭，后续更正返回 409 `reconciliation_closed`。
+- 对账写入失败（503 `storage_write_failed`）时事务回滚，保留原对账状态不变。
+
 ### 发布
 
 ```bash
@@ -68,6 +111,9 @@ curl -s -X POST localhost:8000/v1/publications \
 ```
 
 响应**只包含**加噪计数、发布版本和剩余预算——不返回真实计数、不加噪前的数据或患者编号。
+
+首次发布前必须通过每日对账（见上节）；已发布版本的重放不再校验对账，行为与预算
+消耗均保持原样。
 
 ## 隐私语义
 
@@ -91,4 +137,6 @@ pytest
 ```
 
 覆盖：批内重复整批拒绝、周重复导入、固定分组校验、零计数格、发布幂等与预算计数、
-预算耗尽、写入失败回滚、并发 6 请求最多 3 次成功、数据库层不可改写、Laplace 分布。
+预算耗尽、写入失败回滚、并发 6 请求最多 3 次成功、数据库层不可改写、Laplace 分布、
+每日对账登记与同日更正覆盖、ISO 周边界校验、缺报/合计不符拦截发布、发布后拒绝更正、
+对账写入失败回滚、更正与发布并发的提交顺序语义。

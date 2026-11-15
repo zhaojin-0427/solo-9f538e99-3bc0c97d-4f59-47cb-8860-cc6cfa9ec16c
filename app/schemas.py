@@ -111,6 +111,31 @@ class BudgetResponse(BaseModel):
     remaining_budget: int
 
 
+class ReconciliationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total: int = Field(ge=0)
+
+
+class ReconciliationDay(BaseModel):
+    day: date
+    total: int | None = None
+
+
+class ReconciliationResponse(BaseModel):
+    """Reconciliation state for one imported version's ISO week."""
+
+    import_version: int
+    week: str
+    days: list[ReconciliationDay]
+    missing_days: list[date]
+    reported_total: int
+    import_record_count: int
+    total_matches_import: bool
+    ready_to_publish: bool
+    published: bool
+
+
 class HealthResponse(BaseModel):
     status: str
 

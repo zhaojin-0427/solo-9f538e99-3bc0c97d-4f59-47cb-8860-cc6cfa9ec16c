@@ -39,6 +39,34 @@ class BudgetExhaustedError(DomainError):
     code = "privacy_budget_exhausted"
 
 
+class ReconciliationDateOutsideWeekError(DomainError):
+    """The submitted day is not one of the import's seven ISO-week days."""
+
+    status_code = 422
+    code = "reconciliation_day_outside_week"
+
+
+class ReconciliationClosedError(DomainError):
+    """The version was already published; corrections can no longer land."""
+
+    status_code = 409
+    code = "reconciliation_closed"
+
+
+class ReconciliationIncompleteError(DomainError):
+    """Publication blocked: not all seven daily totals have been registered."""
+
+    status_code = 409
+    code = "reconciliation_incomplete"
+
+
+class ReconciliationTotalMismatchError(DomainError):
+    """Publication blocked: the seven-day total differs from the import size."""
+
+    status_code = 409
+    code = "reconciliation_total_mismatch"
+
+
 class StorageError(DomainError):
     """A write failed; the transaction was rolled back and no budget was spent."""
 

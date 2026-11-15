@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.groups import AGE_BANDS, STREETS
 from app.main import create_app
+from app.service import iso_week_dates
 
 WEEK = "2026-W20"
 
@@ -20,6 +21,31 @@ def make_records(n: int = 5, street: str = "东城街道", age_band: str = "0-14
         {"patient_id": f"p-{i}", "street": street, "age_band": age_band}
         for i in range(n)
     ]
+
+
+def week_day(week: str = WEEK, index: int = 0) -> str:
+    """ISO-week day (Monday=0) rendered as YYYY-MM-DD."""
+
+    return (iso_week_dates(week)[0] + timedelta(days=index)).isoformat()
+
+
+def reconcile_week(client, version: int, week: str = WEEK, total: int | None = None):
+    """Register seven daily totals that add up to the imported record count.
+
+    The whole total is booked on Monday; the other six days report zero.
+    """
+
+    if total is None:
+        total = client.get(f"/v1/imports/{version}").json()["record_count"]
+    days = iso_week_dates(week)
+    for index, day in enumerate(days):
+        day_total = total if index == 0 else 0
+        response = client.put(
+            f"/v1/imports/{version}/reconciliation/days/{day.isoformat()}",
+            json={"total": day_total},
+        )
+        assert response.status_code == 200, response.text
+    return client.get(f"/v1/imports/{version}/reconciliation").json()
 
 
 @pytest.fixture()
@@ -136,6 +162,7 @@ class TestImports:
 class TestPublications:
     def test_publication_covers_all_cells_and_spends_one_budget(self, client):
         import_week(client)
+        reconcile_week(client, version=1)
         response = client.post("/v1/publications", json={"import_version": 1})
         assert response.status_code == 200
         body = response.json()
@@ -156,14 +183,18 @@ class TestPublications:
 
     def test_repeat_publication_is_idempotent_and_free(self, client):
         import_week(client)
+        reconcile_week(client, version=1)
         first = client.post("/v1/publications", json={"import_version": 1}).json()
         second = client.post("/v1/publications", json={"import_version": 1}).json()
         assert second == first
         assert client.get("/v1/budget").json()["spent"] == 1
 
     def test_budget_exhaustion_blocks_new_publication(self, client):
-        for week in ("2026-W20", "2026-W21", "2026-W22", "2026-W23"):
+        weeks = ("2026-W20", "2026-W21", "2026-W22", "2026-W23")
+        for week in weeks:
             import_week(client, week=week)
+        for version, week in enumerate(weeks, start=1):
+            reconcile_week(client, version=version, week=week)
         for version in (1, 2, 3):
             assert client.post(
                 "/v1/publications", json={"import_version": version}
@@ -199,6 +230,7 @@ class TestPublications:
         )
         with TestClient(app) as c:
             assert import_week(c).status_code == 201
+            reconcile_week(c, version=1)
 
             response = c.post("/v1/publications", json={"import_version": 1})
             assert response.status_code == 503
@@ -206,6 +238,10 @@ class TestPublications:
 
             assert c.get("/v1/budget").json()["spent"] == 0
             assert c.get("/v1/publications/1").status_code == 404
+            # The reconciliation used for the failed attempt is still in place.
+            state = c.get("/v1/imports/1/reconciliation").json()
+            assert state["ready_to_publish"] is True
+            assert state["published"] is False
 
         with sqlite3.connect(db_path) as conn:
             assert conn.execute("SELECT COUNT(*) FROM publications").fetchone()[0] == 0
@@ -244,12 +280,14 @@ class TestPublications:
 
         healthy = create_app(database_path=db_path, total_budget=3)
         with TestClient(healthy) as c:
+            reconcile_week(c, version=1, week="2026-W20")
             seeded = c.post("/v1/publications", json={"import_version": 1}).json()
 
         failed = create_app(
             database_path=db_path, total_budget=3, publish_before_commit=explode
         )
         with TestClient(failed) as c:
+            reconcile_week(c, version=2, week="2026-W21", total=2)
             response = c.post("/v1/publications", json={"import_version": 2})
             assert response.status_code == 503
             assert c.get("/v1/budget").json()["spent"] == 1
@@ -261,10 +299,13 @@ class TestPublications:
 class TestConcurrency:
     def test_concurrent_publications_never_overspend(self, db_path):
         app = create_app(database_path=db_path, total_budget=3)
-        for i in range(6):
-            week = f"2026-W{20 + i:02d}"
+        weeks = [f"2026-W{20 + i:02d}" for i in range(6)]
+        for i, week in enumerate(weeks):
             with TestClient(app) as setup:
-                assert import_week(setup, week=week, records=make_records(2)).status_code == 201
+                assert import_week(
+                    setup, week=week, records=make_records(2)
+                ).status_code == 201
+                reconcile_week(setup, version=i + 1, week=week, total=2)
 
         statuses: list[tuple[int, int | None]] = []
         lock = threading.Lock()
@@ -304,6 +345,7 @@ class TestConcurrency:
 class TestStorageInvariants:
     def test_database_rejects_rewrites(self, client, db_path):
         import_week(client)
+        reconcile_week(client, version=1)
         client.post("/v1/publications", json={"import_version": 1})
 
         with sqlite3.connect(db_path) as conn:
@@ -316,9 +358,29 @@ class TestStorageInvariants:
                 "DELETE FROM publications",
                 "UPDATE publication_cells SET noisy_count = 0",
                 "DELETE FROM publication_cells",
+                "DELETE FROM daily_totals",
             ):
                 with pytest.raises(sqlite3.DatabaseError):
                     conn.execute(statement)
+
+    def test_daily_totals_allow_correction_but_not_delete(self, client, db_path):
+        import_week(client)
+        monday = week_day(index=0)
+        assert client.put(
+            f"/v1/imports/1/reconciliation/days/{monday}", json={"total": 3}
+        ).status_code == 200
+        # Same-day correction overwrites the previous value.
+        assert client.put(
+            f"/v1/imports/1/reconciliation/days/{monday}", json={"total": 5}
+        ).status_code == 200
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT total FROM daily_totals WHERE import_version = 1 AND day = ?",
+                (monday,),
+            ).fetchone()
+            assert row == (5,)
+            with pytest.raises(sqlite3.DatabaseError):
+                conn.execute("DELETE FROM daily_totals")
 
     def test_raw_patient_ids_are_not_stored(self, client, db_path):
         import_week(client, records=make_records(4))

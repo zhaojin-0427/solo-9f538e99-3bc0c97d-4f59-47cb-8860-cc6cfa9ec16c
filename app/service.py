@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Callable, Iterable
 
 from .db import Database
@@ -13,6 +14,10 @@ from .errors import (
     DuplicatePatientError,
     ImportNotFoundError,
     PublicationNotFoundError,
+    ReconciliationClosedError,
+    ReconciliationDateOutsideWeekError,
+    ReconciliationIncompleteError,
+    ReconciliationTotalMismatchError,
     StorageError,
     WeekAlreadyImportedError,
 )
@@ -23,6 +28,25 @@ from .schemas import CountCell, PatientRecordIn
 # Optional test hook invoked after all publication rows are written but before
 # COMMIT, letting tests prove that a failing write leaves nothing behind.
 BeforeCommitHook = Callable[[int], None]
+
+# Optional test hook invoked inside a reconciliation write transaction, after
+# the daily total has been upserted but before COMMIT.
+ReconciliationHook = Callable[[int, date], None]
+
+_WEEK_PATTERN = re.compile(r"^(\d{4})-W(\d{2})$")
+
+
+def iso_week_dates(week: str) -> list[date]:
+    """Return the seven calendar days (Monday..Sunday) of an ISO week label."""
+
+    match = _WEEK_PATTERN.fullmatch(week)
+    # Import requests already validate the label; keep a defensive guard.
+    if match is None:
+        raise ValueError("week must use the ISO form YYYY-Www")
+    year, week_number = int(match.group(1)), int(match.group(2))
+    return [
+        date.fromisocalendar(year, week_number, weekday) for weekday in range(1, 8)
+    ]
 
 
 def _now() -> str:
@@ -43,6 +67,7 @@ class ReleaseService:
         cost_per_publication: int = COST_PER_PUBLICATION,
         epsilon: float = EPSILON,
         before_commit: BeforeCommitHook | None = None,
+        reconciliation_before_commit: ReconciliationHook | None = None,
     ) -> None:
         if total_budget < 0:
             raise ValueError("total_budget must be non-negative")
@@ -55,6 +80,7 @@ class ReleaseService:
         self.cost_per_publication = cost_per_publication
         self.epsilon = epsilon
         self._before_commit = before_commit
+        self._reconciliation_before_commit = reconciliation_before_commit
 
     # ------------------------------------------------------------------ #
     # Imports
@@ -194,13 +220,23 @@ class ReleaseService:
                     }
 
                 imported = conn.execute(
-                    "SELECT version FROM imports WHERE version = ?",
+                    "SELECT version, week, record_count FROM imports "
+                    "WHERE version = ?",
                     (import_version,),
                 ).fetchone()
                 if imported is None:
                     raise ImportNotFoundError(
                         f"import version {import_version} does not exist"
                     )
+
+                # First-publication gate: the seven daily outpatient totals
+                # must all be registered and add up to the imported headcount.
+                self._assert_reconciliation_ready(
+                    conn,
+                    import_version,
+                    str(imported["week"]),
+                    int(imported["record_count"]),
+                )
 
                 _, _, remaining = self._budget_from(conn)
                 if remaining < self.cost_per_publication:
@@ -303,6 +339,160 @@ class ReleaseService:
                 ],
                 "remaining_budget": total - spent,
             }
+
+    # ------------------------------------------------------------------ #
+    # Reconciliation
+    # ------------------------------------------------------------------ #
+    def register_daily_total(
+        self, import_version: int, day: date, total: int
+    ) -> dict:
+        """Register (or correct) one day's outpatient total for a version.
+
+        * ``day`` must be one of the seven ISO-week days of the import.
+        * A correction for an already-registered day overwrites the old value.
+        * Once the version has been published, corrections are rejected:
+          publication and correction are serialized by ``BEGIN IMMEDIATE``,
+          so whichever transaction commits first decides the outcome.
+        * Any write failure rolls the transaction back, leaving the previous
+          reconciliation state untouched.
+        """
+
+        try:
+            with self.db.transaction() as conn:
+                imported = conn.execute(
+                    "SELECT week FROM imports WHERE version = ?",
+                    (import_version,),
+                ).fetchone()
+                if imported is None:
+                    raise ImportNotFoundError(
+                        f"import version {import_version} does not exist"
+                    )
+
+                week_days = iso_week_dates(str(imported["week"]))
+                if day not in week_days:
+                    raise ReconciliationDateOutsideWeekError(
+                        f"day {day.isoformat()} does not belong to ISO week "
+                        f"{imported['week']} of import version {import_version}"
+                    )
+
+                published = conn.execute(
+                    "SELECT 1 FROM publications WHERE import_version = ?",
+                    (import_version,),
+                ).fetchone()
+                if published is not None:
+                    raise ReconciliationClosedError(
+                        f"import version {import_version} has already been "
+                        "published; its reconciliation can no longer be changed"
+                    )
+
+                conn.execute(
+                    "INSERT INTO daily_totals "
+                    "(import_version, day, total, updated_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (import_version, day) DO UPDATE SET "
+                    "total = excluded.total, updated_at = excluded.updated_at",
+                    (import_version, day.isoformat(), total, _now()),
+                )
+
+                if self._reconciliation_before_commit is not None:
+                    self._reconciliation_before_commit(import_version, day)
+
+                state = self._reconciliation_state(conn, import_version)
+        except sqlite3.Error as exc:
+            raise StorageError(
+                "the reconciliation write failed; the previous reconciliation "
+                "state was preserved"
+            ) from exc
+        return state
+
+    def get_reconciliation(self, import_version: int) -> dict:
+        with self.db.read() as conn:
+            imported = conn.execute(
+                "SELECT week, record_count FROM imports WHERE version = ?",
+                (import_version,),
+            ).fetchone()
+            if imported is None:
+                raise ImportNotFoundError(
+                    f"import version {import_version} does not exist"
+                )
+            return self._reconciliation_state(conn, import_version)
+
+    @staticmethod
+    def _assert_reconciliation_ready(
+        conn: sqlite3.Connection,
+        import_version: int,
+        week: str,
+        record_count: int,
+    ) -> None:
+        """Gate a first publication on a complete, consistent reconciliation."""
+
+        rows = conn.execute(
+            "SELECT day, total FROM daily_totals WHERE import_version = ?",
+            (import_version,),
+        ).fetchall()
+        registered = {row["day"]: int(row["total"]) for row in rows}
+        week_days = iso_week_dates(week)
+        missing = [day for day in week_days if day.isoformat() not in registered]
+        if missing:
+            formatted = ", ".join(day.isoformat() for day in missing)
+            raise ReconciliationIncompleteError(
+                "all seven daily outpatient totals must be registered before "
+                f"the first publication; missing day(s): {formatted}"
+            )
+        reported_total = sum(registered.values())
+        if reported_total != record_count:
+            raise ReconciliationTotalMismatchError(
+                f"the seven-day total ({reported_total}) does not match the "
+                f"imported record count ({record_count}); correct the daily "
+                "totals before publication"
+            )
+
+    def _reconciliation_state(
+        self, conn: sqlite3.Connection, import_version: int
+    ) -> dict:
+        imported = conn.execute(
+            "SELECT week, record_count FROM imports WHERE version = ?",
+            (import_version,),
+        ).fetchone()
+        if imported is None:  # defensive; callers check first
+            raise ImportNotFoundError(
+                f"import version {import_version} does not exist"
+            )
+        week = str(imported["week"])
+        record_count = int(imported["record_count"])
+        rows = conn.execute(
+            "SELECT day, total FROM daily_totals WHERE import_version = ?",
+            (import_version,),
+        ).fetchall()
+        registered = {row["day"]: int(row["total"]) for row in rows}
+
+        week_days = iso_week_dates(week)
+        days = [
+            {"day": day, "total": registered.get(day.isoformat())}
+            for day in week_days
+        ]
+        missing = [day for day in week_days if day.isoformat() not in registered]
+        reported_total = sum(registered.values())
+        complete = not missing
+        total_matches = complete and reported_total == record_count
+        published = (
+            conn.execute(
+                "SELECT 1 FROM publications WHERE import_version = ?",
+                (import_version,),
+            ).fetchone()
+            is not None
+        )
+        return {
+            "import_version": import_version,
+            "week": week,
+            "days": days,
+            "missing_days": missing,
+            "reported_total": reported_total,
+            "import_record_count": record_count,
+            "total_matches_import": total_matches,
+            "ready_to_publish": total_matches,
+            "published": published,
+        }
 
     # ------------------------------------------------------------------ #
     # Helpers

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import date
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -26,9 +27,11 @@ from .schemas import (
     PublicationListResponse,
     PublicationResponse,
     PublishRequest,
+    ReconciliationRequest,
+    ReconciliationResponse,
     ServiceInfoResponse,
 )
-from .service import BeforeCommitHook, ReleaseService
+from .service import BeforeCommitHook, ReconciliationHook, ReleaseService
 
 
 def _total_budget_from_env() -> int:
@@ -46,6 +49,7 @@ def create_app(
     database_path: str | None = None,
     total_budget: int | None = None,
     publish_before_commit: BeforeCommitHook | None = None,
+    reconciliation_before_commit: ReconciliationHook | None = None,
 ) -> FastAPI:
     db_path = database_path or os.environ.get("DATABASE_PATH", "/data/fevers.db")
     budget = _total_budget_from_env() if total_budget is None else total_budget
@@ -53,7 +57,10 @@ def create_app(
     database = Database(db_path)
     database.initialize(budget)
     service = ReleaseService(
-        database, total_budget=budget, before_commit=publish_before_commit
+        database,
+        total_budget=budget,
+        before_commit=publish_before_commit,
+        reconciliation_before_commit=reconciliation_before_commit,
     )
 
     app = FastAPI(
@@ -123,5 +130,22 @@ def create_app(
     @app.get("/v1/publications", response_model=PublicationListResponse)
     def list_publications() -> PublicationListResponse:
         return PublicationListResponse(**service.list_publications())
+
+    @app.put(
+        "/v1/imports/{version}/reconciliation/days/{day}",
+        response_model=ReconciliationResponse,
+    )
+    def register_daily_total(
+        version: int, day: date, payload: ReconciliationRequest
+    ) -> ReconciliationResponse:
+        result = service.register_daily_total(version, day, payload.total)
+        return ReconciliationResponse(**result)
+
+    @app.get(
+        "/v1/imports/{version}/reconciliation",
+        response_model=ReconciliationResponse,
+    )
+    def get_reconciliation(version: int) -> ReconciliationResponse:
+        return ReconciliationResponse(**service.get_reconciliation(version))
 
     return app
